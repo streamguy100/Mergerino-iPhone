@@ -1,0 +1,402 @@
+diff --git a/src/messages/MessageFlag.hpp b/src/messages/MessageFlag.hpp
+index fdb37b7..fff36d2 100644
+--- a/src/messages/MessageFlag.hpp
++++ b/src/messages/MessageFlag.hpp
+@@ -81,6 +81,13 @@ enum class MessageFlag : std::int64_t {
+     TikTokJoinMessage = (1LL << 45),
+     /// A Twitch raid or Kick stream host announcement.
+     Raid = (1LL << 46),
++    /// iPhone message style only: this message was sent by the currently
++    /// logged-in Twitch or Kick account, so its lines are right-aligned
++    /// in the chat row. Layout-only: it is set on a *copy* of the message
++    /// flags in MessageLayout::actuallyLayout and is never written back
++    /// to Message::flags, never persisted, and never used for moderation,
++    /// highlights, or protocol decisions.
++    IPhoneOwnMessage = (1LL << 47),
+ };
+ using MessageFlags = FlagsEnum<MessageFlag>;
+ 
+diff --git a/src/messages/layouts/MessageLayout.cpp b/src/messages/layouts/MessageLayout.cpp
+index 5983655..320b4f4 100644
+--- a/src/messages/layouts/MessageLayout.cpp
++++ b/src/messages/layouts/MessageLayout.cpp
+@@ -5,6 +5,9 @@
+ #include "messages/layouts/MessageLayout.hpp"
+ 
+ #include "Application.hpp"
++#include "controllers/accounts/AccountController.hpp"
++#include "providers/kick/KickAccount.hpp"
++#include "providers/twitch/TwitchAccount.hpp"
+ #include "messages/layouts/MessageLayoutContainer.hpp"
+ #include "messages/layouts/MessageLayoutContext.hpp"
+ #include "messages/layouts/MessageLayoutElement.hpp"
+@@ -427,6 +430,88 @@ QColor defaultPlatformAccent(MessagePlatform platform)
+     }
+ }
+ 
++// ---------------------------------------------------------------------------
++// iPhone message style (style only, added 2026-11-01).
++// These helpers are used only when Settings::iphoneMessageStyle is on.
++// They never touch channels, protocols, moderation, or emote providers.
++// The platform outline reuses Mergerino's own platform accent, which is
++// already purple for Twitch (145, 70, 255) and green for Kick (83, 252, 24),
++// so the 12-answer colours come from upstream data, not a new mapping.
++// ---------------------------------------------------------------------------
++
++bool iphoneStyleEnabled()
++{
++    return getSettings()->iphoneMessageStyle.getValue();
++}
++
++/// True when this message was sent by the currently logged-in account, on
++/// either platform. Twitch and Kick accounts are checked independently, so
++/// a user logged in as official_robust_clan on both is "own" on both.
++/// Anonymous accounts never match: an empty login name is not own.
++bool iphoneIsOwnMessage(const Message &message)
++{
++    if (message.loginName.isEmpty())
++    {
++        return false;
++    }
++    auto *accounts = getApp()->getAccounts();
++    if (accounts == nullptr)
++    {
++        return false;
++    }
++    if (auto twitch = accounts->twitch.getCurrent(); twitch != nullptr &&
++        !twitch->isAnon() &&
++        twitch->getUserName().compare(message.loginName,
++                                      Qt::CaseInsensitive) == 0)
++    {
++        return true;
++    }
++    if (auto kick = accounts->kick.current(); kick != nullptr &&
++        !kick->isAnonymous() &&
++        kick->username().compare(message.loginName,
++                                 Qt::CaseInsensitive) == 0)
++    {
++        return true;
++    }
++    return false;
++}
++
++QString iphoneDisplayName(const Message &message)
++{
++    return message.displayName.isEmpty() ? message.loginName
++                                         : message.displayName;
++}
++
++/// The single initial painted in the avatar circle for received messages.
++/// Initials only: Qt chat rows carry no per-message profile photo (see the
++/// README), and no face or photo is guessed here.
++QChar iphoneAvatarInitial(const Message &message)
++{
++    const QString name = iphoneDisplayName(message);
++    return name.isEmpty() ? QChar('?') : name.at(0).toUpper();
++}
++
++QColor iphoneOutlineColor(const Message &message)
++{
++    return message.platformAccentColor.value_or(
++        defaultPlatformAccent(message.platform));
++}
++
++/// Bubble fill for iPhone style. Sent messages use iOS message blue in
++/// both themes; received messages use the iOS system grey for the current
++/// theme, inferred from the chat text colour (dark text = light theme).
++/// Highlighted messages keep their highlight colour as the fill instead;
++/// see MessageLayout::paintBackground.
++QColor iphoneBubbleFill(const QColor &textColor, bool isOwn)
++{
++    if (isOwn)
++    {
++        return QColor("#0a84ff");
++    }
++    const bool lightTheme = textColor.lightness() < 128;
++    return lightTheme ? QColor("#e9e9eb") : QColor("#2c2c2e");
++}
++
+ QColor fallbackPlatformHighlightColor(const Message &message,
+                                       const QColor &highlightColor)
+ {
+@@ -748,6 +833,71 @@ void MessageLayout::paintBackground(QPainter &painter, const QRect &rect,
+         return;
+     }
+ 
++    // iPhone message style (style only): paint the row as a rounded bubble
++    // with a platform-coloured outline, instead of the normal full-width
++    // row fill. Qt chat rows are full-width, so this is a *row* bubble,
++    // not a content-tight phone bubble: long messages still wrap at full
++    // row width, and own messages are right-aligned per line by
++    // MessageLayoutContainer (see IPhoneOwnMessage there). System messages
++    // and messages without a sender keep the normal background below.
++    // The bubble is painted here, before the elements are painted on top
++    // of it in updateBuffer, so the avatar circle below must line up with
++    // the avatar indent added for received lines in breakLine.
++    if (iphoneStyleEnabled() && !this->message_->loginName.isEmpty() &&
++        !this->message_->flags.has(MessageFlag::System))
++    {
++        const qreal s = this->scale_ > 0 ? this->scale_ : 1;
++        const bool isOwn = iphoneIsOwnMessage(*this->message_);
++        const QColor outline = iphoneOutlineColor(*this->message_);
++        QColor fill = iphoneBubbleFill(ctx.messageColors.regularText, isOwn);
++        if ((this->message_->flags.has(MessageFlag::Highlighted) ||
++             this->message_->flags.has(MessageFlag::HighlightedWhisper)) &&
++            this->message_->highlightColor)
++        {
++            fill = *this->message_->highlightColor;
++        }
++
++        painter.save();
++        painter.setRenderHint(QPainter::Antialiasing, true);
++        // Received bubbles start after the avatar circle (when avatars
++        // are on), so the avatar sits outside the bubble, iMessage-style;
++        // sent bubbles use the normal inset on both sides.
++        const bool showAvatar =
++            !isOwn && getSettings()->iphoneMessageShowAvatars.getValue();
++        const qreal bubbleLeft =
++            showAvatar ? 32 * s : 6 * s;
++        const QRectF bubble(
++            rect.left() + bubbleLeft, rect.top() + 2 * s,
++            rect.width() - bubbleLeft - 6 * s, rect.height() - 4 * s);
++        QPainterPath path;
++        path.addRoundedRect(bubble, 14 * s, 14 * s);
++        painter.setPen(QPen(outline, 2 * s));
++        painter.setBrush(fill);
++        painter.drawPath(path);
++
++        // Received messages only: sender initial in a small circle at the
++        // left of the row, next to where the username line starts.
++        // Initials fallback only; no profile photo is fetched or guessed.
++        if (showAvatar)
++        {
++            const qreal diameter = 24 * s;
++            const QRectF avatar(rect.left() + 4 * s, rect.top() + 4 * s,
++                                diameter, diameter);
++            painter.setPen(QPen(outline, 1 * s));
++            painter.setBrush(outline);
++            painter.drawEllipse(avatar);
++            painter.setPen(ctx.messageColors.regularText);
++            QFont font = painter.font();
++            font.setBold(true);
++            font.setPointSizeF(font.pointSizeF() * 0.9);
++            painter.setFont(font);
++            painter.drawText(avatar, Qt::AlignCenter,
++                             QString(iphoneAvatarInitial(*this->message_)));
++        }
++        painter.restore();
++        return;
++    }
++
+     QColor backgroundColor = [&] {
+         if (this->message_->flags.has(MessageFlag::WatchStreak) &&
+             ctx.preferences.enableWatchStreakHighlight)
+@@ -960,6 +1110,14 @@ void MessageLayout::actuallyLayout(const MessageLayoutContext &ctx)
+ 
+     auto messageFlags = this->message_->flags;
+ 
++    // iPhone message style (layout-only): mark own messages on this local
++    // copy only, so MessageLayoutContainer can right-align their lines.
++    // this->message_->flags itself is never modified here.
++    if (iphoneStyleEnabled() && iphoneIsOwnMessage(*this->message_))
++    {
++        messageFlags.set(MessageFlag::IPhoneOwnMessage);
++    }
++
+     if (this->flags.has(MessageLayoutFlag::Expanded) ||
+         (ctx.flags.has(MessageElementFlag::ModeratorTools) &&
+          !this->message_->flags.has(MessageFlag::Disabled)))
+@@ -983,6 +1141,15 @@ void MessageLayout::actuallyLayout(const MessageLayoutContext &ctx)
+     std::vector<LinkElement *> previewLinks;
+     QSet<QString> seenPreviewUrls;
+ 
++    // iPhone style: once per message, put the username (and any badges
++    // before it) on its own line above the message text, so the name reads
++    // as a label above the bubble instead of inline before the text.
++    // Normal Twitch/Kick messages carry exactly one Username element
++    // ("name:"), so this breaks once and only once per message. Whisper
++    // rows, which carry two Username elements, still break after the
++    // first one; that is a known, cosmetic edge case of this style.
++    bool iphoneUsernameLineBroken = false;
++
+     for (const auto &element : this->message_->elements)
+     {
+         if (hideModerated && this->message_->flags.has(MessageFlag::Disabled))
+@@ -1034,6 +1201,14 @@ void MessageLayout::actuallyLayout(const MessageLayoutContext &ctx)
+ 
+         element->addToContainer(this->container_, ctx);
+ 
++        if (iphoneStyleEnabled() && !iphoneUsernameLineBroken &&
++            element->getFlags().has(MessageElementFlag::Username) &&
++            !this->message_->flags.has(MessageFlag::System))
++        {
++            this->container_.breakLine();
++            iphoneUsernameLineBroken = true;
++        }
++
+         if (showLinkPreviews)
+         {
+             auto *linkElement = dynamic_cast<LinkElement *>(element.get());
+diff --git a/src/messages/layouts/MessageLayoutContainer.cpp b/src/messages/layouts/MessageLayoutContainer.cpp
+index f993f88..7cfe7c3 100644
+--- a/src/messages/layouts/MessageLayoutContainer.cpp
++++ b/src/messages/layouts/MessageLayoutContainer.cpp
+@@ -176,6 +176,33 @@ void MessageLayoutContainer::breakLine()
+                        .right()) /
+                   2;
+     }
++    // iPhone message style (layout only, no protocol or data change):
++    // - Own messages: right-align each line, like a sent iMessage. This
++    //   is the same arithmetic as Centered above, without the /2, and it
++    //   relies on IPhoneOwnMessage being set on the layout copy of the
++    //   flags in MessageLayout::actuallyLayout, never on the message.
++    // - Received messages: indent each line by the avatar circle width
++    //   plus a gap, so the avatar painted in MessageLayout::paintBackground
++    //   sits to the left of the username and message text.
++    // Both branches are skipped entirely when the style is off.
++    else if (getSettings()->iphoneMessageStyle.getValue() &&
++             this->elements_.size() > 0)
++    {
++        if (this->flags_.has(MessageFlag::IPhoneOwnMessage))
++        {
++            const int marginOffset = int(MARGIN.left() * this->scale_) +
++                                     int(MARGIN.right() * this->scale_);
++            xOffset = this->width_ - marginOffset -
++                      this->elements_.at(this->elements_.size() - 1)
++                          ->getRect()
++                          .right();
++        }
++        else if (getSettings()->iphoneMessageShowAvatars.getValue())
++        {
++            // 24px avatar circle + 8px gap, matching paintBackground.
++            xOffset = 32 * this->scale_;
++        }
++    }
+ 
+     for (size_t i = this->lineStart_; i < this->elements_.size(); i++)
+     {
+diff --git a/src/singletons/Settings.hpp b/src/singletons/Settings.hpp
+index 64c5849..55bc658 100644
+--- a/src/singletons/Settings.hpp
++++ b/src/singletons/Settings.hpp
+@@ -342,6 +342,26 @@ public:
+         "/appearance/messages/messageOverflow", MessageOverflow::Highlight};
+     BoolSetting separateMessages = {"/appearance/messages/separateMessages",
+                                     false};
++    // iPhone message style (style only, added 2026-11-01).
++    // When on, chat rows are painted as iPhone Messages-style bubbles:
++    // received on the left, the logged-in user's own messages on the right,
++    // with a purple (Twitch) or green (Kick) bubble outline on both sides,
++    // the username on its own line above the message text, and no
++    // timestamps. It does not change channels, protocols, moderation,
++    // highlights, or emote providers. Pair it with the "iPhone (Light)" or
++    // "iPhone (Dark)" theme in Settings > Appearance > Themes for the
++    // light/dark toggle of this style; the theme itself is switched there,
++    // this setting only switches the bubble layout on and off.
++    BoolSetting iphoneMessageStyle = {
++        "/appearance/messages/iphoneMessageStyle", false};
++    // In iPhone style only: reserve space at the left of received messages
++    // and paint the sender's initial in a small circle next to their name.
++    // This is an initials fallback, not a fetched profile photo: Qt chat
++    // rows do not carry a per-message avatar, and no face or photo is
++    // guessed here. Real profile pictures remain available in the existing
++    // user-info popup. See MERGERINO-QT-STYLE-README.md.
++    BoolSetting iphoneMessageShowAvatars = {
++        "/appearance/messages/iphoneMessageShowAvatars", true};
+     BoolSetting fadeMessageHistory = {"/appearance/messages/fadeMessageHistory",
+                                       true};
+     BoolSetting hideModerated = {"/appearance/messages/hideModerated", false};
+diff --git a/src/singletons/Theme.cpp b/src/singletons/Theme.cpp
+index bdcc3a1..bf54f58 100644
+--- a/src/singletons/Theme.cpp
++++ b/src/singletons/Theme.cpp
+@@ -934,6 +934,21 @@ const std::vector<ThemeDescriptor> Theme::builtInThemes{
+         .path = ":/themes/Dark.json",
+         .name = "Default",
+     },
++    // iPhone message style themes (added 2026-11-01, style only).
++    // Inserted after Dark on purpose: fallbackTheme is builtInThemes.at(1)
++    // (Dark), and inserting before it would silently change the fallback.
++    // These are the light/dark pair for the iPhone style; switching
++    // between them is the light/dark toggle for that style.
++    {
++        .key = "iPhoneLight",
++        .path = ":/themes/iPhoneLight.json",
++        .name = "iPhone (Light)",
++    },
++    {
++        .key = "iPhoneDark",
++        .path = ":/themes/iPhoneDark.json",
++        .name = "iPhone (Dark)",
++    },
+     // Static colour themes: {surface, ink, accent} for dark, then light
+     makePreset("preset.amber.dark", "Amber",
+                {"#0f131a", "#c5c3bc", "#e6b450"},
+diff --git a/src/singletons/WindowManager.cpp b/src/singletons/WindowManager.cpp
+index 4c2fb8e..9fedf4b 100644
+--- a/src/singletons/WindowManager.cpp
++++ b/src/singletons/WindowManager.cpp
+@@ -224,6 +224,12 @@ WindowManager::WindowManager(const Args &appArgs_, const Paths &paths,
+     qCDebug(chatterinoWindowmanager) << "init WindowManager";
+ 
+     this->updateWordTypeMaskListener.add(settings.showTimestamps);
++    // iPhone message style: toggling it must rebuild the word mask (it
++    // suppresses timestamps, see updateWordTypeMask) and re-lay out chat.
++    this->updateWordTypeMaskListener.add(settings.iphoneMessageStyle);
++    this->forceLayoutChannelViewsListener.add(settings.iphoneMessageStyle);
++    this->forceLayoutChannelViewsListener.add(
++        settings.iphoneMessageShowAvatars);
+     this->updateWordTypeMaskListener.add(settings.showBadgesGlobalAuthority);
+     this->updateWordTypeMaskListener.add(settings.showBadgesPredictions);
+     this->updateWordTypeMaskListener.add(settings.showBadgesChannelAuthority);
+@@ -331,7 +337,11 @@ void WindowManager::updateWordTypeMask()
+     auto flags = MessageElementFlags(MEF::Text);
+ 
+     // timestamp
+-    if (settings->showTimestamps)
++    // iPhone message style: no timestamps, just bubbles (12-answer Q8).
++    // This only removes the Timestamp element from the layout mask; the
++    // underlying parseTime / serverReceivedTime on each Message is kept
++    // untouched, so turning the style off restores timestamps exactly.
++    if (settings->showTimestamps && !settings->iphoneMessageStyle)
+     {
+         flags.set(MEF::Timestamp);
+     }
+diff --git a/src/widgets/settingspages/GeneralPage.cpp b/src/widgets/settingspages/GeneralPage.cpp
+index 588f8c6..5cee161 100644
+--- a/src/widgets/settingspages/GeneralPage.cpp
++++ b/src/widgets/settingspages/GeneralPage.cpp
+@@ -534,6 +534,33 @@ void GeneralPage::initLayout(GeneralPageView &layout)
+                      "message to help better tell them apart.")
+         ->addTo(layout);
+ 
++    // iPhone message style (style only, 2026-11-01): chat rows become
++    // iPhone Messages-style bubbles — received on the left, your own
++    // messages on the right, purple outline for Twitch, green for Kick,
++    // username above the message, no timestamps. Pair with the
++    // "iPhone (Light)" or "iPhone (Dark)" theme under Settings >
++    // Appearance > Themes for the light/dark version of this style.
++    // It does not change channels, protocols, moderation, or emotes.
++    SettingWidget::checkbox("iPhone message style", s.iphoneMessageStyle)
++        ->setTooltip(
++            "Paint chat as iPhone Messages-style bubbles: received on the "
++            "left, your own messages on the right, with a purple outline "
++            "for Twitch and a green outline for Kick, the username above "
++            "the message, and no timestamps.")
++        ->addKeywords({"iphone", "imessage", "bubble", "messages"})
++        ->addTo(layout);
++
++    SettingWidget::checkbox("Show avatar initials in iPhone style",
++                            s.iphoneMessageShowAvatars)
++        ->setTooltip(
++            "Only used when iPhone message style is on. Paints the "
++            "sender's initial in a small circle next to received "
++            "messages. This is an initials fallback, not a fetched "
++            "profile photo; real profile pictures stay in the user-info "
++            "popup.")
++        ->addKeywords({"iphone", "avatar", "initials"})
++        ->addTo(layout);
++
+     SettingWidget::checkbox("Message animations", s.messageAnimations)
+         ->setTooltip("Smoothly animate new messages in every tab.")
+         ->addTo(layout);
