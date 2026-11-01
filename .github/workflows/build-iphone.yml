@@ -1,0 +1,154 @@
+name: Build iPhone Qt Windows
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: build-iphone-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CONAN_VERSION: 2.11.0
+
+jobs:
+  build-windows:
+    name: "Build Windows x64 (iPhone style)"
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Clone upstream Mergerino v1.3.4
+        shell: pwsh
+        run: |
+          git clone https://github.com/EbrahimTahernejad/Mergerino.git upstream
+          cd upstream
+          git checkout a47a1c0
+          git submodule update --init --recursive
+
+      - name: Apply iPhone style patch and themes
+        shell: pwsh
+        run: |
+          Copy-Item iphone-style.patch upstream/iphone-style.patch
+          Copy-Item resources/themes/iPhoneLight.json upstream/resources/themes/iPhoneLight.json
+          Copy-Item resources/themes/iPhoneDark.json upstream/resources/themes/iPhoneDark.json
+          cd upstream
+          git apply iphone-style.patch
+          git status --short
+          git diff --stat
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install Qt6
+        uses: jurplel/install-qt-action@v4.3.0
+        with:
+          cache: true
+          cache-key-prefix: windows-qt-6.9.3-v1
+          modules: qtimageformats
+          version: 6.9.3
+          arch: win64_msvc2022_64
+          setup-python: false
+
+      - name: Enable Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+
+      - name: Setup sccache
+        uses: hendrikmuhs/ccache-action@v1.2.22
+        with:
+          variant: sccache
+          key: sccache-build-windows-x64-6.9.3-iphone
+          restore-keys: |
+            sccache-build-windows-x64
+
+      - name: Cache conan packages
+        uses: actions/cache@v5
+        with:
+          key: ${{ runner.os }}-${{ runner.arch }}-conan-user-QT6-iphone
+          path: ~/.conan2/
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-conan-user-
+
+      # NOTE: Upstream "Prepare release auth config" step is intentionally
+      # SKIPPED here. It throws if MRAB/PHGTK secrets are missing, and
+      # those secrets are not set in this repo and must not fail the build.
+      # The app builds and runs without the release auth blob; YouTube
+      # auth falls back to the MRAB environment variable at runtime.
+
+      - name: Install and setup Conan
+        shell: bash
+        run: |
+          pip install conan==${{ env.CONAN_VERSION }}
+          conan --version
+          conan profile detect -f
+
+      - name: Install dependencies
+        shell: bash
+        working-directory: upstream
+        run: |
+          mkdir build
+          cd build
+          conan install .. \
+            -s build_type=Release \
+            -c tools.cmake.cmaketoolchain:generator="Ninja" \
+            -b missing \
+            --output-folder=. \
+            -o with_openssl3=True
+
+      - name: Build
+        shell: pwsh
+        working-directory: upstream
+        run: |
+          cd build
+          cmake `
+            -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="conan_toolchain.cmake" `
+            -DUSE_PRECOMPILED_HEADERS=ON `
+            -DCHATTERINO_LTO=OFF `
+            -DFORCE_JSON_GENERATION=Off `
+            -DCHATTERINO_SPELLCHECK=On `
+            ..
+          ninja
+
+      - name: Package
+        working-directory: upstream/build
+        shell: pwsh
+        run: |
+          $packageDir = "Mergerino"
+          if (Test-Path $packageDir) {
+            Remove-Item $packageDir -Recurse -Force
+          }
+          windeployqt bin/mergerino.exe --release --no-compiler-runtime --no-translations --no-opengl-sw --dir $packageDir --force-openssl
+          Copy-Item bin/mergerino.exe $packageDir/
+          Get-ChildItem bin -Filter '*.dll' | Copy-Item -Destination $packageDir -Force
+          if (Test-Path "bin/kick_onboarding") {
+            Copy-Item bin/kick_onboarding $packageDir/kick_onboarding -Recurse -Force
+          }
+          ..\.CI\deploy-crt.ps1 $packageDir
+          if (Test-Path "Mergerino.zip") {
+            Remove-Item "Mergerino.zip" -Force
+          }
+          7z a Mergerino.zip .\$packageDir\*
+
+      - name: Upload artifact (zip)
+        uses: actions/upload-artifact@v7
+        with:
+          name: Mergerino.zip
+          path: upstream/build/Mergerino.zip
+
+      - name: Upload artifact (exe)
+        uses: actions/upload-artifact@v7
+        with:
+          name: mergerino.exe
+          path: upstream/build/Mergerino/mergerino.exe
